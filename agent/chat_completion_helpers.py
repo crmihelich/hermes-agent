@@ -2605,6 +2605,12 @@ class _StreamingCall(StreamingWaitMonitor):
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
+        # Absolute request duration is intentionally independent of chunk liveness.
+        # A provider can otherwise keep this stream alive forever by emitting deltas
+        # without ever producing a terminal response.
+        self._stream_started_at = time.time()
+        self._stream_hard_timeout = None
+        self._stream_hard_timeout_fired = False
         self.stream_attempt_lock = threading.Lock()
         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
         self.managed_stream_holder = {"stream": None}
@@ -3453,6 +3459,56 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
         self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
+    def _abort_for_hard_timeout(self, elapsed: float) -> None:
+        """Abort one non-terminating stream after its absolute wall-clock ceiling.
+
+        This differs from stale-stream recovery: real chunks may still be arriving,
+        so reconnecting the same request would only restart the monopoly. The timeout
+        is request-local, never closes the shared client from this monitor thread, and
+        surfaces a terminal timeout back to the normal turn error path.
+        """
+        if self._stream_hard_timeout_fired:
+            return
+        self._stream_hard_timeout_fired = True
+        self._request_cancelled["value"] = True
+        _est_ctx = estimate_request_context_tokens(self.api_kwargs)
+        logger.warning(
+            "Stream exceeded hard wall-clock ceiling after %.0fs (threshold %.0fs). "
+            "model=%s context=~%s tokens. Aborting request without retry.",
+            elapsed, self._stream_hard_timeout, self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+        )
+        self.agent._buffer_status(
+            f"⚠️ Provider stream exceeded its {int(self._stream_hard_timeout)}s hard limit "
+            f"(model: {self.api_kwargs.get('model', 'unknown')}). Aborting this request."
+        )
+        killed_response = self._attempt_stream_response
+        with contextlib.suppress(Exception):
+            self._cancel_current_stream_attempt("stream_hard_timeout")
+            self.clients.close_once("stream_hard_timeout")
+        self._shutdown_stale_attempt_socket(killed_response)
+        self.agent._touch_activity(f"stream hard timeout after {int(elapsed)}s")
+
+    def _resolve_hard_timeout(self) -> None:
+        """Resolve the absolute stream ceiling; 0/negative means disabled.
+
+        Local providers default to 900s. Remote providers remain unchanged unless
+        explicitly configured, preserving existing cloud reasoning behavior.
+        """
+        configured = None
+        with contextlib.suppress(Exception):
+            from hermes_cli.config import load_config_readonly
+            cfg = load_config_readonly()
+            agent_cfg = cfg.get("agent") if isinstance(cfg, dict) else None
+            value = agent_cfg.get("local_stream_hard_timeout") if isinstance(agent_cfg, dict) else None
+            if isinstance(value, (int, float)):
+                configured = float(value)
+        if self.agent.base_url and is_local_endpoint(self.agent.base_url):
+            default = 900.0 if configured is None else configured
+            value = env_float("HERMES_LOCAL_STREAM_HARD_TIMEOUT", default)
+            self._stream_hard_timeout = value if value > 0 else float("inf")
+            return
+        self._stream_hard_timeout = float("inf")
+
     def _abort_for_interrupt(self, stale_elapsed: float) -> None:
         """/stop seen by the monitor: mark cancelled, abort the request-local
         socket, wait for the worker, flag the interrupt."""
@@ -3557,6 +3613,7 @@ class _StreamingCall(StreamingWaitMonitor):
         """Resolve the stale timeout, run the request (worker thread or inline),
         drive the heartbeat/stale/interrupt monitor, then translate the outcome."""
         self._resolve_stale_timeout()
+        self._resolve_hard_timeout()
         # Delegated children and cron turns run the request INLINE (a worker inside
         # their nested pools wedges before the socket opens) but must still STREAM
         # (edge proxies kill silent POSTs). Only the poll loop moves to a monitor
@@ -3576,6 +3633,10 @@ class _StreamingCall(StreamingWaitMonitor):
             self.worker = threading.Thread(target=_context_thread_target(self._run_call), daemon=True)
             self.worker.start()
             self._monitor_loop()
+        if self._stream_hard_timeout_fired:
+            raise TimeoutError(
+                f"Provider stream exceeded hard wall-clock ceiling ({int(self._stream_hard_timeout)}s)"
+            )
         if self._monitor_interrupted["yes"]:
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag

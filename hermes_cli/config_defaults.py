@@ -232,6 +232,11 @@ DEFAULT_CONFIG = {
         # wedged local server eventually trips the detector instead of hanging forever. Env
         # HERMES_LOCAL_STREAM_STALE_TIMEOUT overrides.
         "local_stream_stale_timeout": 900,
+        # Absolute wall-clock ceiling for one local-provider stream. Unlike the stale timeout,
+        # incoming chunks do not reset this clock. This prevents a provider that keeps emitting
+        # non-terminal deltas forever from monopolizing an unattended agent slot. 0 disables.
+        # Env HERMES_LOCAL_STREAM_HARD_TIMEOUT overrides.
+        "local_stream_hard_timeout": 900,
         # How user-attached images reach the main model (gateway, TUI, CLI /attach). "auto" = native
         # when the model reports supports_vision=True AND auxiliary.vision.provider is not
         # explicitly set, else text; "native" = always attach (non-vision models error at the

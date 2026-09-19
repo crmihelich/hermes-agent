@@ -71,6 +71,13 @@ class StreamingWaitMonitor:
                 self._mon.last_heartbeat = _hb_now
                 self._heartbeat(int(_hb_now - self.last_chunk_time["t"]))
             _stale_elapsed = time.time() - self.last_chunk_time["t"]
+            _started_at = getattr(self, "_stream_started_at", time.time())
+            _hard_timeout = getattr(self, "_stream_hard_timeout", float("inf"))
+            _total_elapsed = time.time() - _started_at
+            if _total_elapsed > _hard_timeout:
+                self._mon.wait_notice_started_ts = None
+                self._abort_for_hard_timeout(_total_elapsed)
+                return
             if _stale_elapsed > self._stream_stale_timeout:
                 self._mon.wait_notice_started_ts = None  # Reconnect status has its own owner.
                 self._kill_stale_stream(_stale_elapsed)
